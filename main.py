@@ -77,10 +77,60 @@ def find_roll_col(df):
 
 
 # ---------------- ENDPOINTS ---------------- #
-
+BASE_URL = "https://tempx.vercel.app"
 @app.get("/")
 def home():
-    return {"message": "Welcome to the Student Results API 🚀"}
+    endpoints = [
+        {
+            "Endpoint": "/students",
+            "Method": "GET",
+            "Description": "Fetch all students' data",
+            "Example URL": f"{BASE_URL}/students"
+        },
+        {
+            "Endpoint": "/student/{roll_no}",
+            "Method": "GET",
+            "Description": "Get details of a student by roll number",
+            "Example URL": f"{BASE_URL}/student/23CSE001"
+        },
+        {
+            "Endpoint": "/students/department/{dept}",
+            "Method": "GET",
+            "Description": "Get all students in a department",
+            "Example URL": f"{BASE_URL}/students/department/CSE"
+        },
+        {
+            "Endpoint": "/students/crt/{batch}",
+            "Method": "GET",
+            "Description": "Get all students in a CRT batch",
+            "Example URL": f"{BASE_URL}/students/crt/Batch1"
+        },
+        {
+            "Endpoint": "/average/student/{roll_no}",
+            "Method": "GET",
+            "Description": "Get a student's average score",
+            "Example URL": f"{BASE_URL}/average/student/23CSE001"
+        },
+        {
+            "Endpoint": "/average/department/{dept}",
+            "Method": "GET",
+            "Description": "Get average score by department",
+            "Example URL": f"{BASE_URL}/average/department/CSE"
+        },
+        {
+            "Endpoint": "/average/platform/{platform}",
+            "Method": "GET",
+            "Description": "Get average score by platform",
+            "Example URL": f"{BASE_URL}/average/platform/SuperSet"
+        },
+        {
+            "Endpoint": "/average/overall",
+            "Method": "GET",
+            "Description": "Get overall average of all students",
+            "Example URL": f"{BASE_URL}/average/overall"
+        }
+    ]
+    return {"API Endpoints": endpoints}
 
 
 @app.get("/students")
