@@ -1,16 +1,13 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+import motor.motor_asyncio
 import pandas as pd
-import os
-import logging
+from io import BytesIO
 import re
 
-# Logging setup
-logging.basicConfig(level=logging.INFO)
+app = FastAPI()
 
-app = FastAPI(title="Student Results API", version="6.0")
-
-# Allow frontend calls
+# Allow CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,244 +16,137 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-EXCEL_FILE = "students.xlsx"
-def load_excel():
-    """Load Excel safely and detect multi-level headers."""
-    if not os.path.exists(EXCEL_FILE):
-        raise FileNotFoundError("Excel file not found!")
+# MongoDB Connection
+MONGO_URI = "mongodb://localhost:27017"
+client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+db = client["studentDB"]
+students_collection = db["students"]
 
+# ✅ Helper: Flatten multi-level headers
+def flatten_columns(df):
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [
+            "_".join([str(level) for level in col if str(level) != "nan"])
+            for col in df.columns.values
+        ]
+    else:
+        df.columns = [str(col) for col in df.columns]
+    return df
+
+# ✅ Upload Excel (MERGE instead of REPLACE)
+@app.post("/upload-excel")
+async def upload_excel(file: UploadFile = File(...)):
     try:
-        df = pd.read_excel(EXCEL_FILE, header=[0, 1])
-        if isinstance(df.columns, pd.MultiIndex):
-            logging.info("✅ Multi-level header detected.")
-            return df, True
+        contents = await file.read()
+        df = pd.read_excel(BytesIO(contents), header=[0, 1])  # read multi-level headers
+        df = flatten_columns(df)
+
+        if "RollNo" not in df.columns:
+            return {"message": "Excel must contain RollNo column!"}
+
+        # Convert each row into dict and upsert into MongoDB
+        for _, row in df.iterrows():
+            roll_no = row["RollNo"]
+            student_data = row.to_dict()
+
+            # Upsert (insert if new, update if existing)
+            await students_collection.update_one(
+                {"_id": roll_no},
+                {"$set": student_data},
+                upsert=True,
+            )
+
+        return {"message": "Excel uploaded and merged successfully!"}
+
     except Exception as e:
-        logging.warning(f"Multi-level header read failed, falling back to single: {e}")
+        return {"message": f"Upload failed: {str(e)}"}
 
-    df = pd.read_excel(EXCEL_FILE)
-    logging.info("✅ Single-level header detected.")
-    return df, False
-
-
-def normalize_key(key: str) -> str:
-    """Make clean readable keys like College_Test1."""
-    key = str(key).strip()
-    key = re.sub(r"[^a-zA-Z0-9]+", "", key)
-    return key[0].upper() + key[1:] if key else key
-
-
-def convert_to_flat_json(df: pd.DataFrame, multi: bool):
-    """Convert DataFrame into clean JSON with proper keys."""
-    students = []
-    for _, row in df.iterrows():
-        student = {}
-        for col in df.columns:
-            if isinstance(col, tuple):
-                top, sub = col
-                if "Unnamed" in str(sub) or sub.strip() == "":
-                    key = normalize_key(top)
-                else:
-                    key = f"{normalize_key(top)}_{normalize_key(sub)}"
-            else:
-                key = normalize_key(col)
-            student[key] = row[col]
-        students.append(student)
+# ✅ Fetch all students
+@app.get("/students")
+async def get_students():
+    students = await students_collection.find().to_list(1000)
     return students
 
-
-def find_roll_col(df):
-    """Find the correct Roll No column dynamically."""
-    for col in df.columns:
-        if isinstance(col, tuple):
-            if "roll" in str(col[0]).lower() or "roll" in str(col[1]).lower():
-                return col
-        else:
-            if "roll" in str(col).lower():
-                return col
-    raise HTTPException(status_code=500, detail="Roll No column not found in Excel!")
-
-
-# ---------------- ENDPOINTS ---------------- #
-BASE_URL = "https://tempx.vercel.app"
-@app.get("/")
-def home():
-    endpoints = [
-        {
-            "Endpoint": "/students",
-            "Method": "GET",
-            "Description": "Fetch all students' data",
-            "Example URL": f"{BASE_URL}/students"
-        },
-        {
-            "Endpoint": "/student/{roll_no}",
-            "Method": "GET",
-            "Description": "Get details of a student by roll number",
-            "Example URL": f"{BASE_URL}/student/23CSE001"
-        },
-        {
-            "Endpoint": "/students/department/{dept}",
-            "Method": "GET",
-            "Description": "Get all students in a department",
-            "Example URL": f"{BASE_URL}/students/department/CSE"
-        },
-        {
-            "Endpoint": "/students/crt/{batch}",
-            "Method": "GET",
-            "Description": "Get all students in a CRT batch",
-            "Example URL": f"{BASE_URL}/students/crt/Batch1"
-        },
-        {
-            "Endpoint": "/average/student/{roll_no}",
-            "Method": "GET",
-            "Description": "Get a student's average score",
-            "Example URL": f"{BASE_URL}/average/student/23CSE001"
-        },
-        {
-            "Endpoint": "/average/department/{dept}",
-            "Method": "GET",
-            "Description": "Get average score by department",
-            "Example URL": f"{BASE_URL}/average/department/CSE"
-        },
-        {
-            "Endpoint": "/average/platform/{platform}",
-            "Method": "GET",
-            "Description": "Get average score by platform",
-            "Example URL": f"{BASE_URL}/average/platform/SuperSet"
-        },
-        {
-            "Endpoint": "/average/overall",
-            "Method": "GET",
-            "Description": "Get overall average of all students",
-            "Example URL": f"{BASE_URL}/average/overall"
-        }
-    ]
-    return {"API Endpoints": endpoints}
-
-
-@app.get("/students")
-def get_all_students():
-    """Fetch all students."""
-    try:
-        df, multi = load_excel()
-        return convert_to_flat_json(df, multi)
-    except Exception as e:
-        logging.exception("Error fetching students")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
+# ✅ Fetch one student
 @app.get("/student/{roll_no}")
-def get_student_by_roll(roll_no: str):
-    """Fetch a single student by roll number."""
-    try:
-        df, multi = load_excel()
-        roll_col = find_roll_col(df)
-        student_df = df[df[roll_col].astype(str).str.lower() == roll_no.lower()]
-        if student_df.empty:
-            raise HTTPException(status_code=404, detail="Student not found!")
-        return convert_to_flat_json(student_df, multi)[0]
-    except Exception as e:
-        logging.exception("Error fetching student")
-        raise HTTPException(status_code=500, detail=str(e))
+async def get_student(roll_no: str):
+    student = await students_collection.find_one({"_id": roll_no})
+    return student
 
-
+# ✅ Fetch students by department
 @app.get("/students/department/{dept}")
-def get_students_by_department(dept: str):
-    """Fetch students of a specific department."""
-    try:
-        df, multi = load_excel()
-        dept_col = next(col for col in df.columns if "dept" in str(col).lower())
-        filtered_df = df[df[dept_col].astype(str).str.lower() == dept.lower()]
-        return convert_to_flat_json(filtered_df, multi)
-    except StopIteration:
-        raise HTTPException(status_code=500, detail="Department column not found!")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def get_students_by_department(dept: str):
+    students = await students_collection.find({"Department": dept}).to_list(1000)
+    return students
 
-
+# ✅ Fetch students by CRT batch
 @app.get("/students/crt/{crt_batch}")
-def get_students_by_crt(crt_batch: str):
-    """Fetch students of a specific CRT batch."""
-    try:
-        df, multi = load_excel()
-        crt_col = next(col for col in df.columns if "crt" in str(col).lower())
-        filtered_df = df[df[crt_col].astype(str).str.lower() == crt_batch.lower()]
-        return convert_to_flat_json(filtered_df, multi)
-    except StopIteration:
-        raise HTTPException(status_code=500, detail="CRT column not found!")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def get_students_by_crt(crt_batch: str):
+    students = await students_collection.find({"CRT_Batch": crt_batch}).to_list(1000)
+    return students
 
-
+# ✅ Average marks per platform
 @app.get("/average/platform/{platform}")
-def get_platform_average(platform: str):
-    """
-    Get average score for each test in a given platform.
-    Example: /average/platform/College → gives Test1, Test2, etc. averages.
-    """
-    try:
-        df, multi = load_excel()
-        platform_cols = [col for col in df.columns if isinstance(col, tuple) and platform.lower() in str(col[0]).lower()]
-        if not platform_cols:
-            raise HTTPException(status_code=404, detail=f"Platform '{platform}' not found!")
-        averages = {}
-        for col in platform_cols:
-            averages[f"{platform}_{col[1]}"] = round(df[col].mean(), 2)
-        return averages
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def average_platform(platform: str):
+    pipeline = [
+        {"$group": {
+            "_id": None,
+            "avg_score": {"$avg": f"${platform}"}
+        }}
+    ]
+    result = await students_collection.aggregate(pipeline).to_list(1)
+    return result[0] if result else {"avg_score": None}
 
-
-@app.get("/average/student/{roll_no}")
-def get_student_average(roll_no: str):
-    """Get average score per platform for a student."""
-    try:
-        df, multi = load_excel()
-        roll_col = find_roll_col(df)
-        student_df = df[df[roll_col].astype(str).str.lower() == roll_no.lower()]
-        if student_df.empty:
-            raise HTTPException(status_code=404, detail="Student not found!")
-
-        student_row = student_df.iloc[0]
-        averages = {}
-        for col in df.columns:
-            if isinstance(col, tuple) and not "Unnamed" in str(col[1]):
-                platform = normalize_key(col[0])
-                averages.setdefault(platform, [])
-                averages[platform].append(student_row[col])
-        return {k: round(sum(v)/len(v), 2) for k, v in averages.items()}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/average/department/{dept}")
-def get_department_average(dept: str):
-    """Get department-wise average score per platform."""
-    try:
-        df, multi = load_excel()
-        dept_col = next(col for col in df.columns if "dept" in str(col).lower())
-        dept_df = df[df[dept_col].astype(str).str.lower() == dept.lower()]
-        if dept_df.empty:
-            raise HTTPException(status_code=404, detail="No students found for this department!")
-        averages = {}
-        for col in dept_df.columns:
-            if isinstance(col, tuple) and not "Unnamed" in str(col[1]):
-                platform = normalize_key(col[0])
-                averages.setdefault(platform, [])
-                averages[platform].append(dept_df[col].mean())
-        return {k: round(sum(v)/len(v), 2) for k, v in averages.items()}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
+# ✅ Topper per platform
 @app.get("/topper/{platform}")
-def get_platform_topper(platform: str):
-    """Get the topper for a given platform based on total marks."""
-    try:
-        df, multi = load_excel()
-        roll_col = find_roll_col(df)
-        platform_cols = [col for col in df.columns if isinstance(col, tuple) and platform.lower() in str(col[0]).lower()]
-        df["Total"] = df[platform_cols].sum(axis=1)
-        topper_row = df.loc[df["Total"].idxmax()]
-        return {"RollNo": topper_row[roll_col], "TotalMarks": topper_row["Total"]}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def topper(platform: str):
+    topper = await students_collection.find().sort(platform, -1).limit(1).to_list(1)
+    return topper[0] if topper else {}
+
+# ✅ Average per student
+@app.get("/average/student/{roll_no}")
+async def average_student(roll_no: str):
+    student = await students_collection.find_one({"_id": roll_no})
+    if not student:
+        return {"error": "Student not found"}
+    scores = [v for k, v in student.items() if re.search(r"Test\d+", k) and isinstance(v, (int, float))]
+    avg = sum(scores) / len(scores) if scores else None
+    return {"roll_no": roll_no, "average": avg}
+
+# ✅ Average per department
+@app.get("/average/department/{dept}")
+async def average_department(dept: str):
+    students = await students_collection.find({"Department": dept}).to_list(1000)
+    scores = []
+    for s in students:
+        scores += [v for k, v in s.items() if re.search(r"Test\d+", k) and isinstance(v, (int, float))]
+    avg = sum(scores) / len(scores) if scores else None
+    return {"department": dept, "average": avg}
+
+# ✅ Topper per department
+@app.get("/topper/department/{dept}")
+async def topper_department(dept: str):
+    students = await students_collection.find({"Department": dept}).to_list(1000)
+    if not students:
+        return {}
+    toppers = max(students, key=lambda s: sum([v for k, v in s.items() if re.search(r"Test\d+", k) and isinstance(v, (int, float))]))
+    return toppers
+
+# ✅ Overall average
+@app.get("/average/overall")
+async def average_overall():
+    students = await students_collection.find().to_list(1000)
+    scores = []
+    for s in students:
+        scores += [v for k, v in s.items() if re.search(r"Test\d+", k) and isinstance(v, (int, float))]
+    avg = sum(scores) / len(scores) if scores else None
+    return {"overall_average": avg}
+
+# ✅ Overall topper
+@app.get("/overall/topper")
+async def overall_topper():
+    students = await students_collection.find().to_list(1000)
+    if not students:
+        return {}
+    topper = max(students, key=lambda s: sum([v for k, v in s.items() if re.search(r"Test\d+", k) and isinstance(v, (int, float))]))
+    return topper
